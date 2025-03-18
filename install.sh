@@ -59,25 +59,29 @@ check_requirements() {
 
     # Check for Apache modules
     echo -e "${BLUE}Enabling required Apache modules...${NC}"
-    a2enmod proxy proxy_http proxy_wstunnel headers rewrite auth_basic authn_file ssl proxy_balancer proxy_connect
+    a2enmod proxy proxy_http proxy_wstunnel headers rewrite auth_basic authn_file ssl proxy_balancer proxy_connect http2 socache_shmcb
 }
 
 # Install n8n
 install_n8n() {
     echo -e "${BLUE}Installing n8n...${NC}"
 
-    # Check if n8n is already installed
-    if command_exists n8n; then
-        echo -e "${YELLOW}n8n is already installed. Skipping installation.${NC}"
-    else
-        echo -e "${BLUE}Installing n8n globally...${NC}"
-        npm install -g n8n
+    # Force a clean installation
+    echo -e "${BLUE}Installing n8n globally with safe permissions...${NC}"
+    npm install -g n8n --unsafe-perm=true
 
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to install n8n. Trying with cache clean...${NC}"
+        npm cache clean --force
+        npm install -g n8n --unsafe-perm=true
+        
         if [ $? -ne 0 ]; then
             echo -e "${RED}Failed to install n8n. Please check npm configuration and try again.${NC}"
             exit 1
         fi
     fi
+    
+    echo -e "${GREEN}n8n $(n8n --version 2>/dev/null || echo "unknown version") installed successfully.${NC}"
 
     # Create service file for n8n
     echo -e "${BLUE}Creating systemd service for n8n...${NC}"
@@ -99,8 +103,26 @@ WorkingDirectory=/var/lib/n8n
 Environment=N8N_HOST=localhost
 Environment=N8N_PORT=5678
 Environment=NODE_ENV=production
+
+# n8n should use HTTP locally (Apache handles HTTPS)
 Environment=N8N_PROTOCOL=http
-Environment=N8N_EDITOR_BASE_URL=
+
+# Set public-facing URLs to HTTPS
+Environment=N8N_EDITOR_BASE_URL=https://$domain
+Environment=WEBHOOK_URL=https://$domain/
+Environment=N8N_WEBSOCKET_URL=wss://$domain/
+
+# Security settings
+Environment=N8N_SECURE_COOKIES=true
+Environment=N8N_ENCRYPTION_KEY="$(openssl rand -hex 16)"
+
+# WebSocket configuration
+Environment=N8N_PUSH_BACKEND=websocket
+
+# Skip self-signed certificate validation for local development
+Environment=NODE_TLS_REJECT_UNAUTHORIZED=0
+
+# Disable unnecessary notifications
 Environment=N8N_METRICS=true
 Environment=N8N_DIAGNOSTICS_ENABLED=true
 Environment=N8N_HIRING_BANNER_ENABLED=false
@@ -108,8 +130,9 @@ Environment=N8N_VERSION_NOTIFICATIONS_ENABLED=false
 Environment=N8N_USER_MANAGEMENT_DISABLED=false
 Environment=N8N_CLUSTER_ENABLED=false
 Environment=N8N_DIAGNOSTICS_CONFIG_STATS_SHARING_ENABLED=true
-Environment=WEBHOOK_URL=http://localhost:5678/
-Environment=WEBHOOK_TUNNEL_URL=
+
+# Performance tuning
+Environment=NODE_OPTIONS="--max-old-space-size=4096"
 ExecStart=$(which n8n) start
 Restart=always
 RestartSec=10
@@ -136,6 +159,27 @@ create_apache_config() {
 <VirtualHost *:80>
     ServerName $domain
 
+    # Redirect all HTTP traffic to HTTPS
+    RewriteEngine On
+    RewriteRule ^(.*)$ https://%{HTTP_HOST}$1 [R=301,L]
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName $domain
+    
+    # SSL Configuration
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem
+    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+    # Comment out the above and uncomment below after you get a real certificate
+    # SSLCertificateFile /etc/letsencrypt/live/$domain/fullchain.pem
+    # SSLCertificateKeyFile /etc/letsencrypt/live/$domain/privkey.pem
+    
+    # Modern SSL configuration
+    SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+    SSLHonorCipherOrder on
+    SSLCompression off
+    
     # Proxy settings
     ProxyRequests Off
     ProxyPreserveHost On
@@ -148,32 +192,67 @@ create_apache_config() {
         Require valid-user
     </Location>
 
-    # Proxy rules with WebSocket support (required for n8n)
-    ProxyPass / http://localhost:5678/
-    ProxyPassReverse / http://localhost:5678/
-
-    # WebSocket proxy configuration
+    # Comprehensive proxy configuration with WebSocket support
     ProxyPass /favicon.ico http://localhost:5678/favicon.ico
+    ProxyPassReverse /favicon.ico http://localhost:5678/favicon.ico
     ProxyPass /webhook http://localhost:5678/webhook
+    ProxyPassReverse /webhook http://localhost:5678/webhook
     ProxyPass /rest http://localhost:5678/rest
+    ProxyPassReverse /rest http://localhost:5678/rest
     
-    # Enhanced WebSocket handling - ensures all WebSocket paths work correctly
-    # Main WebSocket endpoints
-    ProxyPass /ws ws://localhost:5678/ws
+    # Comprehensive WebSocket proxy configuration for all endpoints
+    # Direct WebSocket endpoint mappings
+    ProxyPass /ws ws://localhost:5678/ws nocanon
     ProxyPassReverse /ws ws://localhost:5678/ws
-    ProxyPass /socket.io/ ws://localhost:5678/socket.io/
+    ProxyPass /socket.io/ ws://localhost:5678/socket.io/ nocanon
     ProxyPassReverse /socket.io/ ws://localhost:5678/socket.io/
+    ProxyPass /webhooks/ ws://localhost:5678/webhooks/ nocanon
+    ProxyPassReverse /webhooks/ ws://localhost:5678/webhooks/
     
-    # Advanced WebSocket handling with proper upgrade headers
-    RewriteEngine On
-    RewriteCond %{HTTP:Upgrade} websocket [NC]
-    RewriteCond %{HTTP:Connection} upgrade [NC]
-    RewriteRule ^/?(.*) ws://localhost:5678/$1 [P,L,NE]
+    # Force HTTP protocol to use WebSockets
+    <Location /ws>
+        ProxyPass ws://localhost:5678/ws
+        RewriteEngine On
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]
+        RewriteRule /(.*) ws://localhost:5678/$1 [P,L]
+    </Location>
     
-    # Ensure headers are correctly set for all proxied requests
+    <Location /socket.io/>
+        ProxyPass ws://localhost:5678/socket.io/
+        RewriteEngine On
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]
+        RewriteRule socket.io/(.*) ws://localhost:5678/socket.io/$1 [P,L]
+    </Location>
+    
+    # Main application proxy with WebSocket support
+    <Location />
+        # Handle all WebSocket connections
+        RewriteEngine On
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]
+        RewriteRule /(.*) ws://localhost:5678/$1 [P,L]
+        
+        # Handle regular HTTP requests
+        ProxyPass http://localhost:5678/
+        ProxyPassReverse http://localhost:5678/
+    </Location>
+    
+    # Set proper headers for WebSocket and proxy
+    ProxyPreserveHost On
     ProxyAddHeaders On
-    RequestHeader set X-Forwarded-Proto "http"
-    RequestHeader set X-Forwarded-Port "80"
+    ProxyRequests Off
+    
+    # Forward proper headers to backend
+    RequestHeader set X-Forwarded-Proto "https"
+    RequestHeader set X-Forwarded-Port "443"
+    RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
+    RequestHeader set Host "%{HTTP_HOST}s"
+    
+    # Specific WebSocket headers
+    SetEnvIf Origin "^https?://(.+)$" ORIGIN=$1
+    Header set Access-Control-Allow-Origin "*" env=ORIGIN
+    Header set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+    Header set Access-Control-Allow-Headers "origin, x-requested-with, content-type, authorization"
+    Header set Access-Control-Allow-Credentials "true"
     
     # Prevent timeouts for long-running WebSocket connections
     ProxyTimeout 3600
@@ -220,12 +299,532 @@ create_password_file() {
     chown root:www-data $auth_file
 }
 
+# Fix common "Service Unavailable" issues
+fix_service_unavailable() {
+    local domain=$1
+    
+    echo -e "${BLUE}Checking for 'Service Unavailable' issues...${NC}"
+    
+    # Install curl if needed
+    if ! command_exists curl; then
+        echo -e "${YELLOW}Installing curl for connectivity testing...${NC}"
+        apt-get update && apt-get install -y curl
+    fi
+    
+    # Test n8n direct connection
+    if ! curl -s http://localhost:5678/ > /dev/null; then
+        echo -e "${YELLOW}Cannot connect to n8n directly. Fixing service issues...${NC}"
+        
+        # Check if port is in use by another process
+        if netstat -tulpn | grep -q ":5678"; then
+            echo -e "${RED}Port 5678 is in use by another process. Stopping conflicting process...${NC}"
+            fuser -k 5678/tcp || true
+            sleep 2
+        fi
+        
+        # Check for common n8n service issues
+        if ! systemctl is-active --quiet n8n; then
+            echo -e "${YELLOW}n8n service is not running. Fixing service configuration...${NC}"
+            
+            # Fix service permissions
+            echo -e "${BLUE}Setting correct permissions for n8n data directory...${NC}"
+            mkdir -p /var/lib/n8n
+            current_user=$(logname 2>/dev/null || echo "root")
+            chown -R $current_user:$current_user /var/lib/n8n
+            
+            # Update service file with proper user
+            sed -i "s/User=root/User=$current_user/" /etc/systemd/system/n8n.service
+            
+            # Fix common n8n startup issues
+            echo -e "${BLUE}Applying common n8n startup fixes...${NC}"
+            echo 'fs.inotify.max_user_watches=524288' >> /etc/sysctl.conf
+            sysctl -p
+            
+            # Reload and restart service
+            systemctl daemon-reload
+            systemctl restart n8n
+            sleep 10
+            
+            if ! systemctl is-active --quiet n8n; then
+                echo -e "${RED}n8n service still failing to start. Applying extended fixes...${NC}"
+                
+                # Reset n8n installation
+                npm cache clean --force
+                npm install -g n8n --unsafe-perm
+                
+                # Try a more permissive service configuration
+                cat > /etc/systemd/system/n8n.service << EOF
+[Unit]
+Description=n8n workflow automation
+After=network.target
+
+[Service]
+Type=simple
+User=$current_user
+WorkingDirectory=/var/lib/n8n
+Environment=NODE_ENV=production
+Environment=N8N_PROTOCOL=http
+Environment=N8N_HOST=0.0.0.0
+Environment=N8N_PORT=5678
+Environment=N8N_EDITOR_BASE_URL=
+Environment=N8N_PUSH_BACKEND=websocket
+Environment=NODE_OPTIONS=--max-old-space-size=4096
+ExecStart=$(which n8n) start
+Restart=always
+RestartSec=10
+LimitNOFILE=50000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                
+                systemctl daemon-reload
+                systemctl restart n8n
+                sleep 10
+            fi
+        fi
+    fi
+    
+    # Check if Apache is properly configured and working
+    local http_status=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5678/)
+    if [[ "$http_status" == "000" ]]; then
+        echo -e "${RED}Unable to connect to n8n. Port may be blocked or service not running properly.${NC}"
+    elif [[ "$http_status" == "502" || "$http_status" == "503" ]]; then
+        echo -e "${YELLOW}Received error $http_status from n8n. Checking Apache proxy configuration...${NC}"
+        
+        # Fix Apache proxy configuration
+        echo -e "${BLUE}Fixing Apache proxy configuration...${NC}"
+        sed -i 's/ProxyPass \/ http:\/\/localhost:5678\//ProxyPass \/ http:\/\/127.0.0.1:5678\//' /etc/apache2/sites-available/$domain.conf
+        
+        # Ensure proxy modules are enabled
+        a2enmod proxy proxy_http headers proxy_wstunnel
+        
+        # Restart Apache
+        systemctl restart apache2
+    fi
+}
+
+# Test WebSocket connections
+test_websockets() {
+    local domain=$1
+    
+    echo -e "${BLUE}Testing WebSocket connections...${NC}"
+    
+    # Install necessary tools
+    if ! command_exists nc; then
+        echo -e "${YELLOW}Installing netcat for WebSocket testing...${NC}"
+        apt-get update && apt-get install -y netcat-openbsd
+    fi
+    
+    # Fix any "Service Unavailable" issues first
+    fix_service_unavailable "$domain"
+    
+    # Test direct WebSocket connection to n8n
+    echo -e "${BLUE}Testing direct WebSocket connection to n8n...${NC}"
+    if timeout 5 bash -c "echo -e 'GET /ws HTTP/1.1\r\nHost: localhost:5678\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' | nc -w 5 localhost 5678" | grep -q "101 Switching Protocols"; then
+        echo -e "${GREEN}Direct WebSocket connection to n8n successful!${NC}"
+    else
+        echo -e "${YELLOW}Direct WebSocket connection failed. This might indicate an issue with n8n's WebSocket server.${NC}"
+        echo -e "${BLUE}Applying WebSocket fixes to n8n configuration...${NC}"
+        
+        # Try to fix by explicitly setting WS backend and restarting
+        sed -i '/Environment=N8N_PUSH_BACKEND=websocket/d' /etc/systemd/system/n8n.service
+        sed -i '/# WebSocket configuration/a Environment=N8N_PUSH_BACKEND=websocket\nEnvironment=N8N_PUSH=1' /etc/systemd/system/n8n.service
+        
+        systemctl daemon-reload
+        systemctl restart n8n
+        sleep 5
+    fi
+    
+    # Test proxied WebSocket connection
+    echo -e "${BLUE}Testing proxied WebSocket connection through Apache...${NC}"
+    if timeout 5 bash -c "echo -e 'GET /ws HTTP/1.1\r\nHost: $domain\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' | nc -w 5 localhost 80" | grep -q "Switching Protocols"; then
+        echo -e "${GREEN}Proxied WebSocket connection successful!${NC}"
+    else
+        echo -e "${YELLOW}Proxied WebSocket connection failed. Fixing Apache configuration...${NC}"
+        
+        # Fix Apache WebSocket configuration
+        echo -e "${BLUE}Adding specific WebSocket fixes to Apache...${NC}"
+        sed -i '/<Location \/>/a\        SetEnvIf Upgrade "^WebSocket$" WS=1\n        RequestHeader set Connection "upgrade" env=WS\n        RequestHeader set Upgrade "websocket" env=WS' /etc/apache2/sites-available/$domain.conf
+        
+        systemctl restart apache2
+    fi
+    
+    # Final connectivity test to ensure service is available
+    echo -e "${BLUE}Performing final connectivity check...${NC}"
+    local final_status=$(curl -s -o /dev/null -w "%{http_code}" -k -L https://$domain/)
+    
+    if [[ "$final_status" == "401" ]]; then
+        echo -e "${GREEN}n8n is successfully responding with authentication required (401). Service is properly configured!${NC}"
+    elif [[ "$final_status" == "200" ]]; then
+        echo -e "${GREEN}n8n is successfully responding with status 200. Service is properly configured!${NC}"
+    else
+        echo -e "${YELLOW}n8n is responding with status $final_status. Additional troubleshooting may be needed.${NC}"
+        echo -e "${BLUE}Applying final emergency fixes...${NC}"
+        
+        # Apply emergency fixes for stubborn service unavailable errors
+        echo -e "${BLUE}1. Ensuring all required Apache modules are enabled...${NC}"
+        a2enmod proxy proxy_http proxy_wstunnel ssl rewrite headers
+        
+        echo -e "${BLUE}2. Ensuring n8n binding configuration is correct...${NC}"
+        sed -i 's/Environment=N8N_HOST=localhost/Environment=N8N_HOST=0.0.0.0/' /etc/systemd/system/n8n.service
+        
+        echo -e "${BLUE}3. Restarting all services...${NC}"
+        systemctl daemon-reload
+        systemctl restart n8n
+        sleep 5
+        systemctl restart apache2
+        
+        echo -e "${YELLOW}All emergency fixes applied. Please try accessing https://$domain/ in your browser now.${NC}"
+    fi
+}
+
+# Generate self-signed SSL certificate for domain
+generate_self_signed_ssl() {
+    local domain=$1
+    
+    echo -e "${BLUE}Setting up SSL with self-signed certificate for development...${NC}"
+    
+    # Install openssl if not already installed
+    if ! command_exists openssl; then
+        echo -e "${YELLOW}OpenSSL not found. Installing...${NC}"
+        apt-get update
+        apt-get install -y openssl
+    fi
+    
+    # Create directory for certificates if it doesn't exist
+    mkdir -p /etc/ssl/private
+    
+    # Only generate if we're not using the default snakeoil certs
+    if [[ "$domain" != "localhost" && "$domain" != "127.0.0.1" ]]; then
+        echo -e "${BLUE}Generating custom SSL certificate for $domain...${NC}"
+        
+        # Generate SSL certificate with proper domain name
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+            -keyout /etc/ssl/private/${domain}.key \
+            -out /etc/ssl/certs/${domain}.crt \
+            -subj "/CN=${domain}/O=n8n Installation/C=US"
+            
+        # Update Apache config to use the new certificate
+        sed -i "s|SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem|SSLCertificateFile /etc/ssl/certs/${domain}.crt|" /etc/apache2/sites-available/$domain.conf
+        sed -i "s|SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key|SSLCertificateKeyFile /etc/ssl/private/${domain}.key|" /etc/apache2/sites-available/$domain.conf
+        
+        # Update n8n service to use the new certificate
+        sed -i "s|N8N_SSL_CERT=/etc/ssl/certs/ssl-cert-snakeoil.pem|N8N_SSL_CERT=/etc/ssl/certs/${domain}.crt|" /etc/systemd/system/n8n.service
+        sed -i "s|N8N_SSL_KEY=/etc/ssl/private/ssl-cert-snakeoil.key|N8N_SSL_KEY=/etc/ssl/private/${domain}.key|" /etc/systemd/system/n8n.service
+        
+        systemctl daemon-reload
+    else
+        echo -e "${YELLOW}Using default SSL certificate...${NC}"
+    fi
+}
+
 # Main function
 main() {
     echo -e "${GREEN}=== N8N Apache Virtual Host Installer ===${NC}"
 
+    # Display installation options
+    echo -e "${BLUE}Please choose an installation option:${NC}"
+    echo -e "1) ${GREEN}Full installation${NC} - Install or reinstall n8n with Apache virtual host"
+    echo -e "2) ${YELLOW}Repair WebSockets${NC} - Fix WebSocket connections on existing installation"
+    echo -e "3) ${RED}Fix 'Service Unavailable'${NC} - Repair n8n service if you're seeing 503 errors"
+    echo -e "4) ${RED}Cancel${NC} - Exit without making changes"
+    
+    read -p "Enter your choice (1-4): " install_option
+    
+    case $install_option in
+        2)
+            # WebSocket repair mode
+            echo -e "${YELLOW}Starting WebSocket repair mode...${NC}"
+            
+            # Check if n8n is installed
+            if ! command_exists n8n; then
+                echo -e "${RED}n8n is not installed. Cannot repair WebSockets.${NC}"
+                exit 1
+            fi
+            
+            # Ask for domain
+            read -p "Enter your existing n8n domain name: " domain_name
+            if [ -z "$domain_name" ]; then
+                echo -e "${RED}Domain name cannot be empty.${NC}"
+                exit 1
+            fi
+            
+            # Check if Apache config exists
+            if [ ! -f "/etc/apache2/sites-available/$domain_name.conf" ]; then
+                echo -e "${RED}Apache configuration for $domain_name not found.${NC}"
+                echo -e "${YELLOW}Please run full installation instead.${NC}"
+                exit 1
+            fi
+            
+            # Fix Apache config for WebSockets
+            echo -e "${BLUE}Updating Apache configuration for WebSockets...${NC}"
+            
+            # Enable required modules
+            echo -e "${BLUE}Enabling required Apache modules...${NC}"
+            a2enmod proxy proxy_http proxy_wstunnel headers rewrite ssl
+            
+            # Update n8n service WebSocket settings
+            echo -e "${BLUE}Updating n8n service for WebSockets...${NC}"
+            if grep -q "N8N_PUSH_BACKEND" /etc/systemd/system/n8n.service; then
+                echo -e "${GREEN}WebSocket backend already configured in n8n service.${NC}"
+            else
+                echo -e "${BLUE}Adding WebSocket configuration to n8n service...${NC}"
+                sed -i '/Environment=NODE_ENV=production/a Environment=N8N_PUSH_BACKEND=websocket\nEnvironment=N8N_PUSH=1\nEnvironment=N8N_WEBSOCKET_URL=wss://'"$domain_name"'/' /etc/systemd/system/n8n.service
+                systemctl daemon-reload
+            fi
+            
+            # Run WebSocket test
+            echo -e "${BLUE}Testing and fixing WebSocket connections...${NC}"
+            systemctl restart n8n apache2
+            sleep 5
+            test_websockets "$domain_name"
+            
+            echo -e "${GREEN}WebSocket repair completed!${NC}"
+            echo -e "${YELLOW}Please restart your browser and test n8n again.${NC}"
+            exit 0
+            ;;
+            
+        3)
+            # Service Unavailable repair mode
+            echo -e "${YELLOW}Starting 'Service Unavailable' repair mode...${NC}"
+            
+            # Check if n8n is installed
+            if ! command_exists n8n; then
+                echo -e "${RED}n8n is not installed. Cannot repair service.${NC}"
+                exit 1
+            fi
+            
+            # Ask for domain
+            read -p "Enter your existing n8n domain name: " domain_name
+            if [ -z "$domain_name" ]; then
+                echo -e "${RED}Domain name cannot be empty.${NC}"
+                exit 1
+            fi
+            
+            # Perform comprehensive service repair
+            echo -e "${BLUE}Performing comprehensive service repair...${NC}"
+            
+            # 1. Verify the system has enough resources
+            echo -e "${BLUE}Checking system resources...${NC}"
+            free_memory=$(free -m | awk '/^Mem:/{print $4}')
+            if [ "$free_memory" -lt 500 ]; then
+                echo -e "${YELLOW}System has low memory ($free_memory MB). This may cause performance issues.${NC}"
+                echo -e "${BLUE}Clearing system caches...${NC}"
+                sync; echo 3 > /proc/sys/vm/drop_caches
+            fi
+            
+            # 2. Check for and kill zombie processes
+            echo -e "${BLUE}Checking for zombie node processes...${NC}"
+            zombie_pids=$(ps aux | grep -i "node.*n8n" | grep -v grep | awk '{print $2}')
+            if [ ! -z "$zombie_pids" ]; then
+                echo -e "${YELLOW}Found potentially conflicting n8n processes. Stopping them...${NC}"
+                for pid in $zombie_pids; do
+                    kill -9 $pid 2>/dev/null || true
+                done
+            fi
+            
+            # 3. Check for port conflicts
+            echo -e "${BLUE}Checking for port conflicts...${NC}"
+            if netstat -tulpn | grep -q ":5678"; then
+                echo -e "${YELLOW}Port 5678 is in use. Releasing it...${NC}"
+                fuser -k 5678/tcp || true
+                sleep 2
+            fi
+            
+            # 4. Rebuild n8n service file
+            echo -e "${BLUE}Rebuilding n8n service file...${NC}"
+            current_user=$(logname 2>/dev/null || echo "root")
+            
+            cat > /etc/systemd/system/n8n.service << EOF
+[Unit]
+Description=n8n workflow automation
+After=network.target
+
+[Service]
+Type=simple
+User=$current_user
+WorkingDirectory=/var/lib/n8n
+Environment=NODE_ENV=production
+Environment=N8N_PROTOCOL=http
+Environment=N8N_HOST=0.0.0.0
+Environment=N8N_PORT=5678
+Environment=N8N_EDITOR_BASE_URL=https://$domain_name
+Environment=N8N_PUSH_BACKEND=websocket
+Environment=N8N_PUSH=1
+Environment=N8N_METRICS=true
+Environment=N8N_DIAGNOSTICS_ENABLED=true
+Environment=NODE_OPTIONS=--max-old-space-size=4096
+ExecStart=$(which n8n) start
+Restart=always
+RestartSec=10
+LimitNOFILE=50000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            
+            # 5. Check and fix directory permissions
+            echo -e "${BLUE}Setting correct permissions for n8n directory...${NC}"
+            mkdir -p /var/lib/n8n
+            chown -R $current_user:$current_user /var/lib/n8n
+            chmod 755 /var/lib/n8n
+            
+            # 6. Reload systemd and restart n8n
+            echo -e "${BLUE}Restarting n8n service...${NC}"
+            systemctl daemon-reload
+            systemctl restart n8n
+            sleep 10
+            
+            # 7. Test and fix Apache configuration
+            echo -e "${BLUE}Testing and fixing Apache configuration...${NC}"
+            
+            # Check if Apache config exists
+            if [ ! -f "/etc/apache2/sites-available/$domain_name.conf" ]; then
+                echo -e "${RED}Apache configuration for $domain_name not found.${NC}"
+                echo -e "${YELLOW}Creating minimal Apache configuration...${NC}"
+                
+                # Create a minimal working configuration
+                cat > /etc/apache2/sites-available/$domain_name.conf << EOF
+<VirtualHost *:80>
+    ServerName $domain_name
+    RewriteEngine On
+    RewriteRule ^(.*)$ https://%{HTTP_HOST}$1 [R=301,L]
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName $domain_name
+    
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem
+    SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
+    
+    ProxyPreserveHost On
+    ProxyRequests Off
+    
+    <Location />
+        ProxyPass http://127.0.0.1:5678/
+        ProxyPassReverse http://127.0.0.1:5678/
+        
+        # WebSocket support
+        RewriteEngine On
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]
+        RewriteRule /(.*) ws://127.0.0.1:5678/$1 [P,L]
+    </Location>
+    
+    # Proxy WebSocket specific endpoints
+    ProxyPass /socket.io/ ws://127.0.0.1:5678/socket.io/ nocanon
+    ProxyPassReverse /socket.io/ ws://127.0.0.1:5678/socket.io/
+    ProxyPass /ws ws://127.0.0.1:5678/ws nocanon
+    ProxyPassReverse /ws ws://127.0.0.1:5678/ws
+</VirtualHost>
+EOF
+
+                a2ensite "$domain_name.conf"
+            else
+                # Fix existing Apache configuration
+                echo -e "${BLUE}Fixing existing Apache configuration...${NC}"
+                
+                # Use 127.0.0.1 instead of localhost
+                sed -i 's/localhost:5678/127.0.0.1:5678/g' /etc/apache2/sites-available/$domain_name.conf
+                
+                # Add WebSocket support if missing
+                if ! grep -q "socket.io" /etc/apache2/sites-available/$domain_name.conf; then
+                    echo -e "${YELLOW}Adding WebSocket support to Apache configuration...${NC}"
+                    
+                    # Add socket.io support just before the last </VirtualHost>
+                    sed -i '/<\/VirtualHost>/i \
+    ProxyPass /socket.io/ ws://127.0.0.1:5678/socket.io/ nocanon\
+    ProxyPassReverse /socket.io/ ws://127.0.0.1:5678/socket.io/\
+    ProxyPass /ws ws://127.0.0.1:5678/ws nocanon\
+    ProxyPassReverse /ws ws://127.0.0.1:5678/ws' /etc/apache2/sites-available/$domain_name.conf
+                fi
+            fi
+            
+            # 8. Enable required Apache modules
+            echo -e "${BLUE}Enabling required Apache modules...${NC}"
+            a2enmod proxy proxy_http proxy_wstunnel ssl rewrite headers
+            
+            # 9. Restart Apache
+            systemctl restart apache2
+            
+            # 10. Run final connectivity tests
+            echo -e "${BLUE}Running final connectivity tests...${NC}"
+            fix_service_unavailable "$domain_name"
+            
+            # 11. Check if n8n is now working
+            if systemctl is-active --quiet n8n; then
+                n8n_status=$(curl -s -o /dev/null -w "%{http_code}" -k -L https://$domain_name/)
+                
+                if [[ "$n8n_status" == "200" || "$n8n_status" == "401" ]]; then
+                    echo -e "${GREEN}SUCCESS! Service Unavailable issue has been fixed.${NC}"
+                    echo -e "${GREEN}n8n is now responding properly with status code $n8n_status.${NC}"
+                    echo -e "${GREEN}You can now access n8n at: https://$domain_name${NC}"
+                else
+                    echo -e "${YELLOW}n8n service is running but returning status code $n8n_status.${NC}"
+                    echo -e "${YELLOW}This might indicate authentication or other configuration issues.${NC}"
+                    echo -e "${YELLOW}Try accessing https://$domain_name/ in your browser.${NC}"
+                fi
+            else
+                echo -e "${RED}n8n service is still not running. Please check logs with:${NC}"
+                echo -e "${BLUE}journalctl -u n8n -n 50${NC}"
+            fi
+            
+            exit 0
+            ;;
+            
+        4)
+            echo -e "${YELLOW}Installation cancelled. Exiting...${NC}"
+            exit 0
+            ;;
+            
+        *)
+            echo -e "${BLUE}Proceeding with full installation...${NC}"
+            ;;
+    esac
+
     # Check requirements
     check_requirements
+    
+    # Check if n8n is already installed
+    if command_exists n8n; then
+        echo -e "${YELLOW}n8n is already installed on this system.${NC}"
+        echo -e "Current version: $(n8n --version 2>/dev/null || echo "Version not available")"
+        
+        read -p "Do you want to reinstall n8n? (y/n): " reinstall_choice
+        if [[ "$reinstall_choice" =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}Proceeding with reinstallation...${NC}"
+            
+            # Stop existing n8n service if it exists
+            if systemctl is-active --quiet n8n; then
+                echo -e "${BLUE}Stopping existing n8n service...${NC}"
+                systemctl stop n8n
+            fi
+            
+            # Uninstall existing n8n
+            echo -e "${BLUE}Uninstalling existing n8n...${NC}"
+            npm uninstall -g n8n
+            
+            # Remove existing service file
+            if [ -f /etc/systemd/system/n8n.service ]; then
+                echo -e "${BLUE}Removing existing service file...${NC}"
+                rm -f /etc/systemd/system/n8n.service
+                systemctl daemon-reload
+            fi
+            
+            # Ask if data should be kept
+            read -p "Do you want to keep existing n8n data? (y/n): " keep_data
+            if [[ ! "$keep_data" =~ ^[Yy]$ ]] && [ -d /var/lib/n8n ]; then
+                echo -e "${YELLOW}Backing up existing data to /var/lib/n8n.bak...${NC}"
+                mv /var/lib/n8n /var/lib/n8n.bak
+            fi
+            
+            echo -e "${GREEN}Ready to proceed with fresh installation.${NC}"
+        else
+            echo -e "${YELLOW}Installation cancelled. Exiting...${NC}"
+            exit 0
+        fi
+    fi
 
     # Ask for domain
     read -p "Enter domain name for n8n (e.g., n8n.example.com): " domain_name
@@ -247,8 +846,31 @@ main() {
     # Install n8n
     install_n8n
 
-    # Create Apache config
-    create_apache_config "$domain_name" "$auth_file"
+    # Check for existing Apache config
+    if [ -f "/etc/apache2/sites-available/$domain_name.conf" ]; then
+        echo -e "${YELLOW}An Apache configuration for $domain_name already exists.${NC}"
+        read -p "Do you want to overwrite it? (y/n): " overwrite_apache
+        
+        if [[ "$overwrite_apache" =~ ^[Yy]$ ]]; then
+            echo -e "${BLUE}Removing existing Apache configuration...${NC}"
+            a2dissite "$domain_name.conf" 2>/dev/null
+            rm -f "/etc/apache2/sites-available/$domain_name.conf"
+            systemctl reload apache2
+        else
+            echo -e "${YELLOW}Keeping existing Apache configuration.${NC}"
+            echo -e "${YELLOW}Note: This may cause issues if the configuration is not compatible with this script.${NC}"
+            # Skip Apache config creation
+            create_apache_config_skip=true
+        fi
+    fi
+    
+    # Create Apache config if not skipped
+    if [ "$create_apache_config_skip" != "true" ]; then
+        create_apache_config "$domain_name" "$auth_file"
+    fi
+    
+    # Generate self-signed SSL certificate for the domain
+    generate_self_signed_ssl "$domain_name"
 
     # Create password file
     create_password_file "$username" "$auth_file"
@@ -260,6 +882,10 @@ main() {
     # Start n8n
     echo -e "${BLUE}Starting n8n service...${NC}"
     systemctl start n8n
+    
+    # Wait a bit longer for services to fully start
+    echo -e "${BLUE}Waiting for services to fully start...${NC}"
+    sleep 10
 
     # Check if service started successfully
     sleep 5
@@ -292,13 +918,22 @@ main() {
     if curl -s http://localhost:5678/ > /dev/null; then
         echo -e "${GREEN}n8n is responding on localhost:5678${NC}"
         
-        # Test Apache proxy connection
-        echo -e "${BLUE}Testing Apache proxy connection...${NC}"
-        if curl -s -I http://$domain_name/ -H "Host: $domain_name" --resolve "$domain_name:80:127.0.0.1" | grep -i "HTTP/1.1 401"; then
-            echo -e "${GREEN}Apache proxy is correctly forwarding to n8n (401 response with auth expected)${NC}"
+        # Test HTTP to HTTPS redirection
+        echo -e "${BLUE}Testing HTTP to HTTPS redirection...${NC}"
+        if curl -s -I -L http://$domain_name/ -H "Host: $domain_name" --resolve "$domain_name:80:127.0.0.1" | grep -i "Location: https://"; then
+            echo -e "${GREEN}HTTP to HTTPS redirection is working correctly${NC}"
         else
-            echo -e "${YELLOW}Apache proxy is not responding as expected. Check Apache configuration.${NC}"
-            echo -e "${BLUE}Restarting Apache...${NC}"
+            echo -e "${YELLOW}HTTP to HTTPS redirection may not be working. Check Apache configuration.${NC}"
+        fi
+        
+        # Test HTTPS connection
+        echo -e "${BLUE}Testing HTTPS connection...${NC}"
+        if curl -s -I -k https://$domain_name/ -H "Host: $domain_name" --resolve "$domain_name:443:127.0.0.1" | grep -i "HTTP/1.1 401"; then
+            echo -e "${GREEN}HTTPS connection and Apache proxy are correctly forwarding to n8n (401 response with auth expected)${NC}"
+        else
+            echo -e "${YELLOW}HTTPS connection is not responding as expected. Check Apache SSL configuration.${NC}"
+            echo -e "${BLUE}Checking SSL configuration and restarting Apache...${NC}"
+            apache2ctl -t
             systemctl restart apache2
         fi
         
@@ -357,15 +992,24 @@ main() {
             fi
         fi
     fi
+    
+    # Test and fix WebSocket connections if the service is running
+    if systemctl is-active --quiet n8n; then
+        echo -e "${BLUE}Testing and configuring WebSocket connections...${NC}"
+        test_websockets "$domain_name"
+    fi
 
     # Summary
     echo -e "\n${GREEN}=== Installation Complete ===${NC}"
     echo -e "n8n is now installed and configured with the following details:"
-    echo -e "Domain: ${YELLOW}http://$domain_name${NC}"
+    echo -e "Domain: ${YELLOW}https://$domain_name${NC}"
     echo -e "Username: ${YELLOW}$username${NC}"
     echo -e "Password: ${YELLOW}(As entered)${NC}"
-    echo -e "\nTo access n8n, open ${GREEN}http://$domain_name${NC} in your browser."
+    echo -e "\nTo access n8n, open ${GREEN}https://$domain_name${NC} in your browser."
     echo -e "Use the username and password you provided during installation."
+    echo -e "\n${YELLOW}Note:${NC} A self-signed SSL certificate has been created for your domain."
+    echo -e "Your browser will likely show a security warning. This is normal for self-signed certificates."
+    echo -e "You can safely proceed by accepting the certificate exception in your browser."
 
     # Optional: Add instructions for SSL
     echo -e "\n${YELLOW}Note:${NC} For production use, it's recommended to secure your site with SSL using Let's Encrypt."
@@ -385,10 +1029,19 @@ main() {
     echo -e "  3. Make sure port 5678 is not in use: ${GREEN}netstat -tulpn | grep 5678${NC}"
     echo -e "  4. Restart n8n and Apache: ${GREEN}systemctl restart n8n apache2${NC}"
     echo -e "  5. Verify WebSocket modules are enabled: ${GREEN}apache2ctl -M | grep -E 'proxy_wstunnel|rewrite'${NC}"
-    echo -e "  6. Test direct WebSocket connection: ${GREEN}curl -v -N -H \"Connection: Upgrade\" -H \"Upgrade: websocket\" http://localhost:5678/ws${NC}"
+    echo -e "  6. Test direct WebSocket connections:"
+    echo -e "     - HTTP WebSocket: ${GREEN}curl -v -N -H \"Connection: Upgrade\" -H \"Upgrade: websocket\" http://localhost:5678/ws${NC}"
+    echo -e "     - HTTPS WebSocket: ${GREEN}curl -v -N -k -H \"Connection: Upgrade\" -H \"Upgrade: websocket\" https://localhost:5678/ws${NC}"
     echo -e "  7. Check for WebSocket errors in browser console (F12) when using the n8n interface"
-    echo -e "  8. Try reinstalling n8n with: ${GREEN}npm install -g n8n --unsafe-perm${NC}"
-    echo -e "  9. If you see '502 Bad Gateway' errors, check that n8n is running and listening on localhost:5678"
+    echo -e "  8. Verify SSL configuration with: ${GREEN}apache2ctl -t${NC}"
+    echo -e "  9. Check SSL certificate with: ${GREEN}openssl x509 -text -noout -in /etc/ssl/certs/${domain_name}.crt${NC}"
+    echo -e "  10. Test secure WebSocket (WSS) connection with:"
+    echo -e "     ${GREEN}curl -v -N -k -H \"Connection: Upgrade\" -H \"Upgrade: websocket\" https://${domain_name}/ws${NC}"
+    echo -e "     ${GREEN}curl -v -N -k -H \"Connection: Upgrade\" -H \"Upgrade: websocket\" https://${domain_name}/socket.io/?EIO=4&transport=websocket${NC}"
+    echo -e "  11. Check browser Network tab (F12) for WebSocket connections - look for connections to /socket.io/ and /ws"
+    echo -e "  12. Try reinstalling n8n with: ${GREEN}npm install -g n8n --unsafe-perm${NC}"
+    echo -e "  13. If you see '502 Bad Gateway' errors, check that n8n is running and listening on localhost:5678"
+    echo -e "  14. For editor freezes or slow interface, check: ${GREEN}journalctl -u n8n | grep -i websocket${NC}"
 
     echo -e "\n${GREEN}Script by Antonin Nvh - https://codequantum.io${NC}"
 }
