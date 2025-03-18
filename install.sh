@@ -269,11 +269,25 @@ EOF
 
     # Enable the site
     a2ensite $domain.conf
-
-    # Add domain to /etc/hosts for local development (if needed)
-    if ! grep -q "$domain" /etc/hosts; then
-        echo -e "${BLUE}Adding $domain to /etc/hosts...${NC}"
-        echo "127.0.0.1 $domain" >> /etc/hosts
+    
+    # Check if domain is a .local domain
+    if [[ "$domain" == *".local" ]]; then
+        echo -e "${GREEN}Using local domain: $domain${NC}"
+        
+        # Ensure Avahi/mDNS is installed for better .local domain resolution
+        if ! command_exists avahi-daemon && command_exists apt-get; then
+            echo -e "${BLUE}Installing Avahi for better .local domain resolution...${NC}"
+            apt-get update
+            apt-get install -y avahi-daemon
+            systemctl enable avahi-daemon
+            systemctl start avahi-daemon
+        fi
+        
+        # Ensure domain is in hosts file (should already be added earlier)
+        if ! grep -q "$domain" /etc/hosts; then
+            echo -e "${BLUE}Adding $domain to /etc/hosts...${NC}"
+            echo "127.0.0.1 $domain" >> /etc/hosts
+        fi
     fi
 }
 
@@ -543,11 +557,24 @@ main() {
                 exit 1
             fi
             
-            # Ask for domain
-            read -p "Enter your existing n8n domain name: " domain_name
+            # Get hostname for default suggestion
+            local hostname=$(hostname -s)
+            local default_domain="${hostname}-n8n.local"
+            
+            # Ask for domain with default suggestion
+            read -p "Enter your existing n8n domain name [default: $default_domain]: " domain_name
+            
+            # Use default if empty
             if [ -z "$domain_name" ]; then
-                echo -e "${RED}Domain name cannot be empty.${NC}"
-                exit 1
+                domain_name="$default_domain"
+                echo -e "${GREEN}Using default domain: $domain_name${NC}"
+                
+                # Ensure domain is in hosts file for .local domains
+                if [[ "$domain_name" == *".local" ]] && ! grep -q "$domain_name" /etc/hosts; then
+                    echo -e "${BLUE}Adding $domain_name to /etc/hosts file...${NC}"
+                    echo "127.0.0.1 $domain_name" >> /etc/hosts
+                    echo -e "${GREEN}✓ Added to hosts file. You'll be able to access n8n using this hostname.${NC}"
+                fi
             fi
             
             # Check if Apache config exists
@@ -595,11 +622,24 @@ main() {
                 exit 1
             fi
             
-            # Ask for domain
-            read -p "Enter your existing n8n domain name: " domain_name
+            # Get hostname for default suggestion
+            local hostname=$(hostname -s)
+            local default_domain="${hostname}-n8n.local"
+            
+            # Ask for domain with default suggestion
+            read -p "Enter your existing n8n domain name [default: $default_domain]: " domain_name
+            
+            # Use default if empty
             if [ -z "$domain_name" ]; then
-                echo -e "${RED}Domain name cannot be empty.${NC}"
-                exit 1
+                domain_name="$default_domain"
+                echo -e "${GREEN}Using default domain: $domain_name${NC}"
+                
+                # Ensure domain is in hosts file for .local domains
+                if [[ "$domain_name" == *".local" ]] && ! grep -q "$domain_name" /etc/hosts; then
+                    echo -e "${BLUE}Adding $domain_name to /etc/hosts file...${NC}"
+                    echo "127.0.0.1 $domain_name" >> /etc/hosts
+                    echo -e "${GREEN}✓ Added to hosts file. You'll be able to access n8n using this hostname.${NC}"
+                fi
             fi
             
             # Perform comprehensive service repair
@@ -826,11 +866,17 @@ EOF
         fi
     fi
 
-    # Ask for domain
-    read -p "Enter domain name for n8n (e.g., n8n.example.com): " domain_name
+    # Get hostname for default suggestion
+    local hostname=$(hostname -s)
+    local default_domain="${hostname}-n8n.local"
+    
+    # Ask for domain with default suggestion
+    read -p "Enter domain name for n8n [default: $default_domain]: " domain_name
+    
+    # Use default if empty
     if [ -z "$domain_name" ]; then
-        echo -e "${RED}Domain name cannot be empty.${NC}"
-        exit 1
+        domain_name="$default_domain"
+        echo -e "${GREEN}Using default domain: $domain_name${NC}"
     fi
 
     # Ask for username
@@ -842,6 +888,24 @@ EOF
 
     # Define auth file location
     auth_file="/etc/apache2/.htpasswd-n8n"
+    
+    # Handle .local domain automatically
+    if [[ "$domain_name" == *".local" ]]; then
+        echo -e "${BLUE}Detected .local domain. This will be automatically configured for local use.${NC}"
+        
+        # Check if domain is already in hosts file
+        if ! grep -q "$domain_name" /etc/hosts; then
+            echo -e "${BLUE}Adding $domain_name to /etc/hosts file...${NC}"
+            echo "127.0.0.1 $domain_name" >> /etc/hosts
+            echo -e "${GREEN}✓ Added to hosts file. You'll be able to access n8n using this hostname.${NC}"
+        else
+            echo -e "${GREEN}✓ $domain_name is already in your hosts file.${NC}"
+        fi
+        
+        # Display hostname information
+        echo -e "${YELLOW}Note: Since you're using a .local domain, you'll only be able to access n8n${NC}"
+        echo -e "${YELLOW}from this machine or from your local network with proper mDNS/Bonjour support.${NC}"
+    fi
 
     # Install n8n
     install_n8n
@@ -1007,6 +1071,16 @@ EOF
     echo -e "Password: ${YELLOW}(As entered)${NC}"
     echo -e "\nTo access n8n, open ${GREEN}https://$domain_name${NC} in your browser."
     echo -e "Use the username and password you provided during installation."
+    
+    # Local domain specific notes
+    if [[ "$domain_name" == *".local" ]]; then
+        echo -e "\n${BLUE}Local Domain Information:${NC}"
+        echo -e "- You are using a .local domain which has been added to your /etc/hosts file"
+        echo -e "- This domain will only work on this machine or on your local network with mDNS/Bonjour"
+        echo -e "- Other devices on your network may need to add this hostname to their hosts file"
+        echo -e "- The local IP address of this server is: ${YELLOW}$(hostname -I | awk '{print $1}')${NC}"
+    fi
+    
     echo -e "\n${YELLOW}Note:${NC} A self-signed SSL certificate has been created for your domain."
     echo -e "Your browser will likely show a security warning. This is normal for self-signed certificates."
     echo -e "You can safely proceed by accepting the certificate exception in your browser."
