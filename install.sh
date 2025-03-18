@@ -66,14 +66,14 @@ check_requirements() {
 install_n8n() {
     echo -e "${BLUE}Installing n8n...${NC}"
 
-    # Force a clean installation
-    echo -e "${BLUE}Installing n8n globally with safe permissions...${NC}"
-    npm install -g n8n --unsafe-perm=true
+    # Force a clean installation of the latest version (@next)
+    echo -e "${BLUE}Installing the latest n8n version globally with safe permissions...${NC}"
+    npm install -g n8n@next --unsafe-perm=true
 
     if [ $? -ne 0 ]; then
         echo -e "${RED}Failed to install n8n. Trying with cache clean...${NC}"
         npm cache clean --force
-        npm install -g n8n --unsafe-perm=true
+        npm install -g n8n@next --unsafe-perm=true
         
         if [ $? -ne 0 ]; then
             echo -e "${RED}Failed to install n8n. Please check npm configuration and try again.${NC}"
@@ -100,7 +100,7 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/var/lib/n8n
-Environment=N8N_HOST=localhost
+Environment=N8N_HOST=0.0.0.0
 Environment=N8N_PORT=5678
 Environment=NODE_ENV=production
 
@@ -118,6 +118,7 @@ Environment=N8N_ENCRYPTION_KEY="$(openssl rand -hex 16)"
 
 # WebSocket configuration
 Environment=N8N_PUSH_BACKEND=websocket
+Environment=N8N_PUSH=1
 
 # Skip self-signed certificate validation for local development
 Environment=NODE_TLS_REJECT_UNAUTHORIZED=0
@@ -133,7 +134,7 @@ Environment=N8N_DIAGNOSTICS_CONFIG_STATS_SHARING_ENABLED=true
 
 # Performance tuning
 Environment=NODE_OPTIONS="--max-old-space-size=4096"
-ExecStart=$(which n8n) start
+ExecStart=$(which n8n) start --tunnel
 Restart=always
 RestartSec=10
 LimitNOFILE=50000
@@ -145,6 +146,166 @@ EOF
     # Reload systemd and enable n8n service
     systemctl daemon-reload
     systemctl enable n8n.service
+}
+
+# Create Nginx configuration
+create_nginx_config() {
+    local domain=$1
+    local auth_file=$2
+
+    echo -e "${BLUE}Creating Nginx virtual host configuration for ${YELLOW}$domain${NC}"
+    
+    # Check if Nginx is installed
+    if ! command_exists nginx; then
+        echo -e "${YELLOW}Nginx is not installed. Installing...${NC}"
+        apt-get update
+        apt-get install -y nginx
+    fi
+    
+    # Create Nginx config directory if it doesn't exist
+    mkdir -p /etc/nginx/sites-available
+    mkdir -p /etc/nginx/sites-enabled
+    
+    # Create the Nginx config file
+    cat > /etc/nginx/sites-available/$domain.conf << EOF
+server {
+    listen 80;
+    server_name $domain;
+    
+    # Redirect all HTTP traffic to HTTPS
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    server_name $domain;
+    
+    # SSL Configuration
+    ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
+    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+    # Comment out the above and uncomment below after you get a real certificate
+    # ssl_certificate /etc/letsencrypt/live/$domain/fullchain.pem;
+    # ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+    
+    # Modern SSL configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_tickets off;
+    
+    # Basic authentication
+    auth_basic "Restricted Area";
+    auth_basic_user_file $auth_file;
+    
+    # Set headers for security
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Content-Type-Options nosniff;
+    add_header X-Frame-Options SAMEORIGIN;
+    add_header X-XSS-Protection "1; mode=block";
+    
+    # Proxy settings
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    client_max_body_size 0;
+    
+    # Regular HTTP endpoints
+    location /favicon.ico {
+        proxy_pass http://127.0.0.1:5678/favicon.ico;
+    }
+    
+    location /webhook {
+        proxy_pass http://127.0.0.1:5678/webhook;
+    }
+    
+    location /rest {
+        proxy_pass http://127.0.0.1:5678/rest;
+    }
+    
+    # WebSocket endpoints
+    location /ws {
+        proxy_pass http://127.0.0.1:5678/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    
+    location /socket.io/ {
+        proxy_pass http://127.0.0.1:5678/socket.io/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    
+    location /webhooks/ {
+        proxy_pass http://127.0.0.1:5678/webhooks/;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+    
+    # Main application proxy with WebSocket support
+    location / {
+        proxy_pass http://127.0.0.1:5678/;
+        
+        # Add WebSocket support to main location
+        proxy_http_version 1.1;
+        
+        # Handle upgrade if present
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
+    }
+    
+    # Logs
+    access_log /var/log/nginx/$domain-access.log;
+    error_log /var/log/nginx/$domain-error.log;
+}
+EOF
+
+    # Add connection upgrade mapping to nginx.conf http block if not already there
+    if ! grep -q "map \$http_upgrade \$connection_upgrade" /etc/nginx/nginx.conf; then
+        echo -e "${BLUE}Adding WebSocket connection mapping to Nginx main config...${NC}"
+        
+        # Create a backup
+        cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
+        
+        # Add the map directive to the http block
+        awk '
+        /^http {/ {
+          print;
+          print "    # WebSocket support";
+          print "    map \\$http_upgrade \\$connection_upgrade {";
+          print "        default upgrade;";
+          print "        \'\' close;";
+          print "    }";
+          next;
+        }
+        {print}
+        ' /etc/nginx/nginx.conf.bak > /etc/nginx/nginx.conf
+    fi
+
+    # Enable the site
+    if [ -d /etc/nginx/sites-enabled ]; then
+        ln -sf /etc/nginx/sites-available/$domain.conf /etc/nginx/sites-enabled/
+    fi
+    
+    # Check nginx config
+    echo -e "${BLUE}Testing Nginx configuration...${NC}"
+    nginx -t
+    
+    # Restart Nginx
+    echo -e "${BLUE}Restarting Nginx...${NC}"
+    systemctl restart nginx
 }
 
 # Create Apache configuration
@@ -169,11 +330,11 @@ create_apache_config() {
     
     # SSL Configuration
     SSLEngine on
+    
+    # Using self-signed certificate by default
+    # These will be automatically updated when you run certbot
     SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem
     SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
-    # Comment out the above and uncomment below after you get a real certificate
-    # SSLCertificateFile /etc/letsencrypt/live/$domain/fullchain.pem
-    # SSLCertificateKeyFile /etc/letsencrypt/live/$domain/privkey.pem
     
     # Modern SSL configuration
     SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
@@ -202,26 +363,33 @@ create_apache_config() {
     
     # Comprehensive WebSocket proxy configuration for all endpoints
     # Direct WebSocket endpoint mappings
-    ProxyPass /ws ws://localhost:5678/ws nocanon
-    ProxyPassReverse /ws ws://localhost:5678/ws
-    ProxyPass /socket.io/ ws://localhost:5678/socket.io/ nocanon
-    ProxyPassReverse /socket.io/ ws://localhost:5678/socket.io/
-    ProxyPass /webhooks/ ws://localhost:5678/webhooks/ nocanon
-    ProxyPassReverse /webhooks/ ws://localhost:5678/webhooks/
+    ProxyPass /ws ws://127.0.0.1:5678/ws nocanon
+    ProxyPassReverse /ws ws://127.0.0.1:5678/ws
+    ProxyPass /socket.io/ ws://127.0.0.1:5678/socket.io/ nocanon
+    ProxyPassReverse /socket.io/ ws://127.0.0.1:5678/socket.io/
+    ProxyPass /webhooks/ ws://127.0.0.1:5678/webhooks/ nocanon
+    ProxyPassReverse /webhooks/ ws://127.0.0.1:5678/webhooks/
     
     # Force HTTP protocol to use WebSockets
     <Location /ws>
-        ProxyPass ws://localhost:5678/ws
+        ProxyPass ws://127.0.0.1:5678/ws
         RewriteEngine On
         RewriteCond %{HTTP:Upgrade} =websocket [NC]
-        RewriteRule /(.*) ws://localhost:5678/$1 [P,L]
+        RewriteRule /(.*) ws://127.0.0.1:5678/$1 [P,L]
     </Location>
     
     <Location /socket.io/>
-        ProxyPass ws://localhost:5678/socket.io/
+        ProxyPass ws://127.0.0.1:5678/socket.io/
         RewriteEngine On
         RewriteCond %{HTTP:Upgrade} =websocket [NC]
-        RewriteRule socket.io/(.*) ws://localhost:5678/socket.io/$1 [P,L]
+        RewriteRule socket.io/(.*) ws://127.0.0.1:5678/socket.io/$1 [P,L]
+    </Location>
+    
+    <Location /webhooks/>
+        ProxyPass ws://127.0.0.1:5678/webhooks/
+        RewriteEngine On
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]
+        RewriteRule webhooks/(.*) ws://127.0.0.1:5678/webhooks/$1 [P,L]
     </Location>
     
     # Main application proxy with WebSocket support
@@ -229,11 +397,11 @@ create_apache_config() {
         # Handle all WebSocket connections
         RewriteEngine On
         RewriteCond %{HTTP:Upgrade} =websocket [NC]
-        RewriteRule /(.*) ws://localhost:5678/$1 [P,L]
+        RewriteRule /(.*) ws://127.0.0.1:5678/$1 [P,L]
         
         # Handle regular HTTP requests
-        ProxyPass http://localhost:5678/
-        ProxyPassReverse http://localhost:5678/
+        ProxyPass http://127.0.0.1:5678/
+        ProxyPassReverse http://127.0.0.1:5678/
     </Location>
     
     # Set proper headers for WebSocket and proxy
@@ -241,18 +409,31 @@ create_apache_config() {
     ProxyAddHeaders On
     ProxyRequests Off
     
+    # Explicitly handle connection upgrade headers
+    SetEnvIf Request_URI "^/ws" WSREQUEST=1
+    SetEnvIf Request_URI "^/socket.io/" WSREQUEST=1
+    SetEnvIf Request_URI "^/webhooks/" WSREQUEST=1
+    RequestHeader set Connection upgrade env=WSREQUEST
+    RequestHeader set Upgrade websocket env=WSREQUEST
+    
     # Forward proper headers to backend
     RequestHeader set X-Forwarded-Proto "https"
     RequestHeader set X-Forwarded-Port "443"
-    RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}s"
-    RequestHeader set Host "%{HTTP_HOST}s"
+    RequestHeader set X-Forwarded-For "%{REMOTE_ADDR}"
+    RequestHeader set Host "%{HTTP_HOST}"
     
     # Specific WebSocket headers
-    SetEnvIf Origin "^https?://(.+)$" ORIGIN=$1
+    SetEnvIf Origin "^(https?://.+)$" ORIGIN=$1
     Header set Access-Control-Allow-Origin "*" env=ORIGIN
     Header set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
     Header set Access-Control-Allow-Headers "origin, x-requested-with, content-type, authorization"
     Header set Access-Control-Allow-Credentials "true"
+    
+    # Ensure WebSocket connection upgrade headers are passed
+    RewriteEngine On
+    RewriteCond %{HTTP:Connection} Upgrade [NC]
+    RewriteCond %{HTTP:Upgrade} websocket [NC]
+    RewriteRule /(.*) ws://127.0.0.1:5678/$1 [P,L]
     
     # Prevent timeouts for long-running WebSocket connections
     ProxyTimeout 3600
@@ -262,13 +443,33 @@ create_apache_config() {
     Header always set Strict-Transport-Security "max-age=63072000; includeSubdomains;"
 
     # Logs
-    ErrorLog \${APACHE_LOG_DIR}/$domain-error.log
-    CustomLog \${APACHE_LOG_DIR}/$domain-access.log combined
+    ErrorLog ${APACHE_LOG_DIR}/$domain-error.log
+    CustomLog ${APACHE_LOG_DIR}/$domain-access.log combined
 </VirtualHost>
 EOF
 
     # Enable the site
     a2ensite $domain.conf
+    
+    # Check if we need to setup SSL with certbot (skip for .local domains)
+    if [[ "$domain" != *".local" ]] && [[ "$domain" != "localhost" ]]; then
+        echo -e "${BLUE}Setting up Let's Encrypt SSL certificate with certbot...${NC}"
+        
+        # Ensure certbot is installed
+        if ! command_exists certbot; then
+            echo -e "${YELLOW}Installing certbot...${NC}"
+            apt-get update
+            apt-get install -y certbot python3-certbot-apache
+        fi
+        
+        # Get the certificate
+        echo -e "${GREEN}Running certbot to obtain SSL certificate for $domain${NC}"
+        echo -e "${YELLOW}Note: You will need to ensure that your domain points to this server and port 80 is open${NC}"
+        certbot --apache -d $domain --non-interactive --agree-tos --email admin@$domain || {
+            echo -e "${YELLOW}Automatic certificate generation failed. You can run it manually later with:${NC}"
+            echo -e "${GREEN}sudo certbot --apache -d $domain${NC}"
+        }
+    fi
     
     # Check if domain is a .local domain
     if [[ "$domain" == *".local" ]]; then
@@ -430,12 +631,17 @@ test_websockets() {
         apt-get update && apt-get install -y netcat-openbsd
     fi
     
+    if ! command_exists curl; then
+        echo -e "${YELLOW}Installing curl for WebSocket testing...${NC}"
+        apt-get update && apt-get install -y curl
+    fi
+    
     # Fix any "Service Unavailable" issues first
     fix_service_unavailable "$domain"
     
-    # Test direct WebSocket connection to n8n
+    # Test direct WebSocket connection to n8n using curl
     echo -e "${BLUE}Testing direct WebSocket connection to n8n...${NC}"
-    if timeout 5 bash -c "echo -e 'GET /ws HTTP/1.1\r\nHost: localhost:5678\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' | nc -w 5 localhost 5678" | grep -q "101 Switching Protocols"; then
+    if curl -s -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" http://127.0.0.1:5678/ws | grep -q "101 Switching Protocols"; then
         echo -e "${GREEN}Direct WebSocket connection to n8n successful!${NC}"
     else
         echo -e "${YELLOW}Direct WebSocket connection failed. This might indicate an issue with n8n's WebSocket server.${NC}"
@@ -456,51 +662,80 @@ test_websockets() {
         systemctl daemon-reload
         systemctl restart n8n
         sleep 5
+        
+        # Test again after configuration changes
+        if curl -s -i -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" http://127.0.0.1:5678/ws | grep -q "101 Switching Protocols"; then
+            echo -e "${GREEN}Direct WebSocket connection to n8n successful after configuration changes!${NC}"
+        else
+            echo -e "${YELLOW}Still having issues with direct WebSocket connection. Proceeding with Apache configuration...${NC}"
+        fi
     fi
     
-    # Test proxied WebSocket connection
-    echo -e "${BLUE}Testing proxied WebSocket connection through Apache...${NC}"
-    if timeout 5 bash -c "echo -e 'GET /ws HTTP/1.1\r\nHost: $domain\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n' | nc -w 5 localhost 80" | grep -q "Switching Protocols"; then
-        echo -e "${GREEN}Proxied WebSocket connection successful!${NC}"
-    else
-        echo -e "${YELLOW}Proxied WebSocket connection failed. Fixing Apache configuration...${NC}"
+    # Ensure Apache modules are enabled
+    echo -e "${BLUE}Ensuring Apache WebSocket modules are enabled...${NC}"
+    a2enmod proxy proxy_http proxy_wstunnel ssl rewrite headers
+    
+    # Check if Apache config file exists
+    if [ -f "/etc/apache2/sites-available/$domain.conf" ]; then
+        echo -e "${BLUE}Checking and enhancing WebSocket support in Apache configuration...${NC}"
         
-        # Check if Apache config file exists
-        if [ -f "/etc/apache2/sites-available/$domain.conf" ]; then
-            echo -e "${BLUE}Adding specific WebSocket fixes to Apache...${NC}"
+        # Add WebSocket-specific configuration
+        if ! grep -q "<Location \/ws" "/etc/apache2/sites-available/$domain.conf"; then
+            echo -e "${BLUE}Adding dedicated WebSocket location blocks...${NC}"
             
-            # Check if Location section exists, if not add it
-            if ! grep -q "<Location \/>" "/etc/apache2/sites-available/$domain.conf"; then
-                # Add Location section before the closing </VirtualHost>
-                sed -i '/<\/VirtualHost>/i \
-    <Location \/>\
-        ProxyPass http:\/\/127.0.0.1:5678\/\
-        ProxyPassReverse http:\/\/127.0.0.1:5678\/\
-    <\/Location>' "/etc/apache2/sites-available/$domain.conf"
-            fi
+            sed -i '/<\/VirtualHost>/i \
+    # WebSocket handling\
+    <Location /ws>\
+        ProxyPass ws://127.0.0.1:5678/ws\
+        ProxyPassReverse ws://127.0.0.1:5678/ws\
+        RewriteEngine On\
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]\
+        RewriteRule /(.*) ws://127.0.0.1:5678/$1 [P,L]\
+    </Location>\
+\
+    <Location /socket.io/>\
+        ProxyPass ws://127.0.0.1:5678/socket.io/\
+        ProxyPassReverse ws://127.0.0.1:5678/socket.io/\
+        RewriteEngine On\
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]\
+        RewriteRule socket.io/(.*) ws://127.0.0.1:5678/socket.io/$1 [P,L]\
+    </Location>\
+\
+    # Additional WebSocket endpoint for editor\
+    <Location /webhooks/>\
+        ProxyPass ws://127.0.0.1:5678/webhooks/\
+        ProxyPassReverse ws://127.0.0.1:5678/webhooks/\
+        RewriteEngine On\
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]\
+        RewriteRule webhooks/(.*) ws://127.0.0.1:5678/webhooks/$1 [P,L]\
+    </Location>' "/etc/apache2/sites-available/$domain.conf"
+        fi
+        
+        # Also ensure main location block has WebSocket support
+        if ! grep -q "RewriteCond %{HTTP:Upgrade}" "/etc/apache2/sites-available/$domain.conf"; then
+            echo -e "${BLUE}Adding WebSocket support to main location block...${NC}"
             
-            # Now add WebSocket configuration to the Location section if not already there
-            if ! grep -q "SetEnvIf Upgrade \"^WebSocket" "/etc/apache2/sites-available/$domain.conf"; then
-                sed -i '/<Location \/>/a\        SetEnvIf Upgrade "^WebSocket$" WS=1\n        RequestHeader set Connection "upgrade" env=WS\n        RequestHeader set Upgrade "websocket" env=WS' "/etc/apache2/sites-available/$domain.conf"
-            fi
+            sed -i '/<Location \/>/a\        RewriteEngine On\n        RewriteCond %{HTTP:Upgrade} =websocket [NC]\n        RewriteRule /(.*) ws://127.0.0.1:5678/$1 [P,L]' "/etc/apache2/sites-available/$domain.conf"
+        fi
+        
+        # Add timeout settings for WebSockets if not present
+        if ! grep -q "ProxyTimeout" "/etc/apache2/sites-available/$domain.conf"; then
+            echo -e "${BLUE}Adding timeout settings for WebSockets...${NC}"
             
-            # Also add explicit WebSocket endpoints if not present
-            if ! grep -q "ProxyPass \/socket.io\/" "/etc/apache2/sites-available/$domain.conf"; then
-                sed -i '/<\/VirtualHost>/i \
-    # WebSocket endpoints\
-    ProxyPass \/socket.io\/ ws:\/\/127.0.0.1:5678\/socket.io\/ nocanon\
-    ProxyPassReverse \/socket.io\/ ws:\/\/127.0.0.1:5678\/socket.io\/\
-    ProxyPass \/ws ws:\/\/127.0.0.1:5678\/ws nocanon\
-    ProxyPassReverse \/ws ws:\/\/127.0.0.1:5678\/ws' "/etc/apache2/sites-available/$domain.conf"
-            fi
-            
-            systemctl restart apache2
-        else
-            echo -e "${RED}Apache configuration file for $domain not found.${NC}"
-            echo -e "${YELLOW}Creating a minimal configuration file...${NC}"
-            
-            # Create a minimal Apache configuration file
-            cat > "/etc/apache2/sites-available/$domain.conf" << EOF
+            sed -i '/<\/VirtualHost>/i \
+    # Prevent timeouts for long-running WebSocket connections\
+    ProxyTimeout 3600\
+    Timeout 3600' "/etc/apache2/sites-available/$domain.conf"
+        fi
+        
+        # Restart Apache to apply changes
+        systemctl restart apache2
+    else
+        echo -e "${RED}Apache configuration file for $domain not found.${NC}"
+        echo -e "${YELLOW}Creating a minimal configuration file with WebSocket support...${NC}"
+        
+        # Create a minimal Apache configuration file
+        cat > "/etc/apache2/sites-available/$domain.conf" << EOF
 <VirtualHost *:80>
     ServerName $domain
     RewriteEngine On
@@ -514,35 +749,88 @@ test_websockets() {
     SSLCertificateFile /etc/ssl/certs/ssl-cert-snakeoil.pem
     SSLCertificateKeyFile /etc/ssl/private/ssl-cert-snakeoil.key
     
+    # Modern SSL configuration
+    SSLProtocol all -SSLv3 -TLSv1 -TLSv1.1
+    SSLHonorCipherOrder on
+    SSLCompression off
+    
+    # Proxy settings
     ProxyPreserveHost On
     ProxyRequests Off
     
+    # Main application proxy
     <Location />
         ProxyPass http://127.0.0.1:5678/
         ProxyPassReverse http://127.0.0.1:5678/
         
         # WebSocket support
-        SetEnvIf Upgrade "^WebSocket$" WS=1
-        RequestHeader set Connection "upgrade" env=WS
-        RequestHeader set Upgrade "websocket" env=WS
-        
         RewriteEngine On
         RewriteCond %{HTTP:Upgrade} =websocket [NC]
         RewriteRule /(.*) ws://127.0.0.1:5678/$1 [P,L]
     </Location>
     
-    # WebSocket endpoints
-    ProxyPass /socket.io/ ws://127.0.0.1:5678/socket.io/ nocanon
-    ProxyPassReverse /socket.io/ ws://127.0.0.1:5678/socket.io/
-    ProxyPass /ws ws://127.0.0.1:5678/ws nocanon
-    ProxyPassReverse /ws ws://127.0.0.1:5678/ws
+    # Dedicated WebSocket endpoints
+    <Location /ws>
+        ProxyPass ws://127.0.0.1:5678/ws
+        ProxyPassReverse ws://127.0.0.1:5678/ws
+        RewriteEngine On
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]
+        RewriteRule /(.*) ws://127.0.0.1:5678/$1 [P,L]
+    </Location>
+    
+    <Location /socket.io/>
+        ProxyPass ws://127.0.0.1:5678/socket.io/
+        ProxyPassReverse ws://127.0.0.1:5678/socket.io/
+        RewriteEngine On
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]
+        RewriteRule socket.io/(.*) ws://127.0.0.1:5678/socket.io/$1 [P,L]
+    </Location>
+    
+    <Location /webhooks/>
+        ProxyPass ws://127.0.0.1:5678/webhooks/
+        ProxyPassReverse ws://127.0.0.1:5678/webhooks/
+        RewriteEngine On
+        RewriteCond %{HTTP:Upgrade} =websocket [NC]
+        RewriteRule webhooks/(.*) ws://127.0.0.1:5678/webhooks/$1 [P,L]
+    </Location>
+    
+    # Forward proper headers
+    RequestHeader set X-Forwarded-Proto "https"
+    RequestHeader set X-Forwarded-Port "443"
+    
+    # Prevent timeouts for long-running WebSocket connections
+    ProxyTimeout 3600
+    Timeout 3600
+    
+    # Logs
+    ErrorLog \${APACHE_LOG_DIR}/$domain-error.log
+    CustomLog \${APACHE_LOG_DIR}/$domain-access.log combined
 </VirtualHost>
 EOF
-            
-            a2ensite "$domain.conf"
-            systemctl restart apache2
+        
+        a2ensite "$domain.conf"
+        systemctl restart apache2
+    fi
+    
+    # Test proxied WebSocket connection using curl
+    echo -e "${BLUE}Testing proxied WebSocket connection through Apache...${NC}"
+    if curl -s -i -k -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" "https://127.0.0.1/ws" -H "Host: $domain" 2>/dev/null | grep -q "101 Switching Protocols"; then
+        echo -e "${GREEN}Proxied WebSocket connection successful!${NC}"
+    else
+        echo -e "${YELLOW}Proxied WebSocket connection test didn't receive expected response. WebSockets may still be working though.${NC}"
+        echo -e "${BLUE}Verifying Apache configuration syntax and restarting service...${NC}"
+        apache2ctl -t
+        systemctl restart apache2
+        
+        echo -e "${BLUE}Testing socket.io endpoint as a fallback...${NC}"
+        if curl -s -i -k -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: SGVsbG8sIHdvcmxkIQ==" "https://127.0.0.1/socket.io/?EIO=4&transport=websocket" -H "Host: $domain" 2>/dev/null | grep -q "101 Switching Protocols"; then
+            echo -e "${GREEN}Socket.io WebSocket connection successful!${NC}"
         fi
     fi
+}
+    
+test_final_connectivity() {
+    local domain=$1
     
     # Final connectivity test to ensure service is available
     echo -e "${BLUE}Performing final connectivity check...${NC}"
@@ -550,19 +838,19 @@ EOF
     # Test using curl with proper host resolution for local domains
     local curl_params="-s -o /dev/null -w %{http_code} -k -L"
     
-    # For .local domains, ensure we use --resolve to handle DNS resolution
-    if [[ "$domain" == *".local" ]]; then
-        # First ensure hosts file is correct
-        if ! grep -q "$domain" /etc/hosts; then
+    # For .local domains, ensure we use host header to handle DNS resolution
+    if [[ "$domain" == *".local" || -z "$domain" ]]; then
+        # First ensure hosts file is correct for .local domains
+        if [[ -n "$domain" ]] && [[ "$domain" == *".local" ]] && ! grep -q "$domain" /etc/hosts; then
             echo -e "${BLUE}Adding $domain to /etc/hosts for local testing...${NC}"
             echo "127.0.0.1 $domain" >> /etc/hosts
         fi
         
-        # Use --resolve to specify IP for the hostname
-        local final_status=$(curl $curl_params --resolve "$domain:443:127.0.0.1" "https://$domain/")
+        # Use host header instead of domain resolution
+        local final_status=$(curl $curl_params "https://127.0.0.1/" -H "Host: $domain" 2>/dev/null || echo "000")
     else
         # Regular curl for normal domains
-        local final_status=$(curl $curl_params "https://$domain/")
+        local final_status=$(curl $curl_params "https://$domain/" 2>/dev/null || echo "000")
     fi
     
     if [[ "$final_status" == "401" ]]; then
@@ -606,10 +894,11 @@ EOF
         
         # One final check after emergency fixes
         sleep 3
-        if [[ "$domain" == *".local" ]]; then
-            local final_check=$(curl $curl_params --resolve "$domain:443:127.0.0.1" "https://$domain/")
+        if [[ "$domain" == *".local" || -z "$domain" ]]; then
+            # If domain is empty or ends with .local, use IP directly
+            local final_check=$(curl $curl_params "https://127.0.0.1/" -H "Host: $domain" 2>/dev/null || echo "000")
         else
-            local final_check=$(curl $curl_params "https://$domain/")
+            local final_check=$(curl $curl_params "https://$domain/" 2>/dev/null || echo "000")
         fi
         
         if [[ "$final_check" == "401" || "$final_check" == "200" ]]; then
@@ -670,12 +959,155 @@ main() {
     echo -e "${BLUE}Please choose an installation option:${NC}"
     echo -e "1) ${GREEN}Full installation${NC} - Install or reinstall n8n with Apache virtual host"
     echo -e "2) ${YELLOW}Repair WebSockets${NC} - Fix WebSocket connections on existing installation"
-    echo -e "3) ${RED}Fix 'Service Unavailable'${NC} - Repair n8n service if you're seeing 503 errors"
-    echo -e "4) ${RED}Cancel${NC} - Exit without making changes"
+    echo -e "3) ${RED}Fix 'Service Unavailable'${NC} - Repair n8n service if you're seeing 503 errors" 
+    echo -e "4) ${GREEN}Install with Nginx${NC} - Install n8n with Nginx virtual host (recommended for WebSockets)"
+    echo -e "5) ${RED}Cancel${NC} - Exit without making changes"
     
-    read -p "Enter your choice (1-4): " install_option
+    read -p "Enter your choice (1-5): " install_option
     
     case $install_option in
+        4)
+            # Install with Nginx
+            echo -e "${GREEN}Starting installation with Nginx...${NC}"
+            
+            # Check requirements
+            check_requirements
+            
+            # Check if n8n is already installed
+            if command_exists n8n; then
+                echo -e "${YELLOW}n8n is already installed on this system.${NC}"
+                echo -e "Current version: $(n8n --version 2>/dev/null || echo "Version not available")"
+                
+                read -p "Do you want to reinstall n8n? (y/n): " reinstall_choice
+                if [[ "$reinstall_choice" =~ ^[Yy]$ ]]; then
+                    echo -e "${BLUE}Proceeding with reinstallation...${NC}"
+                    
+                    # Stop existing n8n service if it exists
+                    if systemctl is-active --quiet n8n; then
+                        echo -e "${BLUE}Stopping existing n8n service...${NC}"
+                        systemctl stop n8n
+                    fi
+                    
+                    # Uninstall existing n8n
+                    echo -e "${BLUE}Uninstalling existing n8n...${NC}"
+                    npm uninstall -g n8n
+                    
+                    # Remove existing service file
+                    if [ -f /etc/systemd/system/n8n.service ]; then
+                        echo -e "${BLUE}Removing existing service file...${NC}"
+                        rm -f /etc/systemd/system/n8n.service
+                        systemctl daemon-reload
+                    fi
+                    
+                    # Ask if data should be kept
+                    read -p "Do you want to keep existing n8n data? (y/n): " keep_data
+                    if [[ ! "$keep_data" =~ ^[Yy]$ ]] && [ -d /var/lib/n8n ]; then
+                        echo -e "${YELLOW}Backing up existing data to /var/lib/n8n.bak...${NC}"
+                        mv /var/lib/n8n /var/lib/n8n.bak
+                    fi
+                    
+                    echo -e "${GREEN}Ready to proceed with fresh installation.${NC}"
+                else
+                    echo -e "${YELLOW}Installation cancelled. Exiting...${NC}"
+                    exit 0
+                fi
+            fi
+            
+            # Get hostname for default suggestion
+            local hostname=$(hostname -s 2>/dev/null || echo "server")
+            if [ -z "$hostname" ] || [ "$hostname" == "localhost" ]; then
+                hostname="n8n-server"
+            fi
+            local default_domain="${hostname}-n8n.local"
+            
+            # Ask for domain with default suggestion
+            read -p "Enter domain name for n8n [default: $default_domain]: " domain_name
+            
+            # Use default if empty
+            if [ -z "$domain_name" ]; then
+                domain_name="$default_domain"
+                echo -e "${GREEN}Using default domain: $domain_name${NC}"
+            fi
+            
+            # Ask for username
+            read -p "Enter username for n8n authentication: " username
+            if [ -z "$username" ]; then
+                echo -e "${RED}Username cannot be empty.${NC}"
+                exit 1
+            fi
+            
+            # Define auth file location
+            auth_file="/etc/nginx/.htpasswd-n8n"
+            
+            # Handle .local domain automatically
+            if [[ "$domain_name" == *".local" ]]; then
+                echo -e "${BLUE}Detected .local domain. This will be automatically configured for local use.${NC}"
+                
+                # Check if domain is already in hosts file
+                if ! grep -q "$domain_name" /etc/hosts; then
+                    echo -e "${BLUE}Adding $domain_name to /etc/hosts file...${NC}"
+                    echo "127.0.0.1 $domain_name" >> /etc/hosts
+                    echo -e "${GREEN}✓ Added to hosts file. You'll be able to access n8n using this hostname.${NC}"
+                else
+                    echo -e "${GREEN}✓ $domain_name is already in your hosts file.${NC}"
+                fi
+            fi
+            
+            # Install n8n
+            install_n8n
+            
+            # Create Nginx config
+            create_nginx_config "$domain_name" "$auth_file"
+            
+            # Generate self-signed SSL certificate for the domain
+            generate_self_signed_ssl "$domain_name"
+            
+            # Create password file
+            create_password_file "$username" "$auth_file"
+            
+            # Start n8n
+            echo -e "${BLUE}Starting n8n service...${NC}"
+            systemctl start n8n
+            
+            # Wait a bit longer for services to fully start
+            echo -e "${BLUE}Waiting for services to fully start...${NC}"
+            sleep 10
+            
+            # Check if n8n service started successfully and fix if needed
+            if ! systemctl is-active --quiet n8n; then
+                echo -e "${RED}n8n service failed to start. Checking logs...${NC}"
+                journalctl -u n8n -n 20
+                echo -e "\n${YELLOW}Attempting to fix common issues...${NC}"
+                
+                # Try installing with --unsafe-perm (common fix)
+                echo -e "${BLUE}Reinstalling n8n with --unsafe-perm...${NC}"
+                npm install -g n8n --unsafe-perm
+                
+                # Try starting again
+                systemctl restart n8n
+                sleep 5
+            fi
+            
+            # Test for WebSocket and verify connectivity
+            test_websockets "$domain_name"
+            test_final_connectivity "$domain_name"
+            
+            # Summary
+            echo -e "\n${GREEN}=== Installation with Nginx Complete ===${NC}"
+            echo -e "n8n is now installed and configured with the following details:"
+            echo -e "Domain: ${YELLOW}https://$domain_name${NC}"
+            echo -e "Username: ${YELLOW}$username${NC}"
+            echo -e "Password: ${YELLOW}(As entered)${NC}"
+            echo -e "\nTo access n8n, open ${GREEN}https://$domain_name${NC} in your browser."
+            
+            exit 0
+            ;;
+            
+        5)
+            echo -e "${YELLOW}Installation cancelled. Exiting...${NC}"
+            exit 0
+            ;;
+            
         2)
             # WebSocket repair mode
             echo -e "${YELLOW}Starting WebSocket repair mode...${NC}"
@@ -827,6 +1259,7 @@ Environment=N8N_PORT=5678
 Environment=N8N_EDITOR_BASE_URL=https://$domain_name
 Environment=N8N_PUSH_BACKEND=websocket
 Environment=N8N_PUSH=1
+Environment=N8N_WEBSOCKET_URL=wss://$domain_name/
 Environment=N8N_METRICS=true
 Environment=N8N_DIAGNOSTICS_ENABLED=true
 Environment=NODE_OPTIONS=--max-old-space-size=4096
@@ -927,6 +1360,8 @@ EOF
     ProxyPassReverse /socket.io/ ws://127.0.0.1:5678/socket.io/
     ProxyPass /ws ws://127.0.0.1:5678/ws nocanon
     ProxyPassReverse /ws ws://127.0.0.1:5678/ws
+    ProxyPass /webhooks/ ws://127.0.0.1:5678/webhooks/ nocanon
+    ProxyPassReverse /webhooks/ ws://127.0.0.1:5678/webhooks/
     
     # Prevent timeouts for long-running WebSocket connections
     ProxyTimeout 3600
@@ -951,7 +1386,9 @@ EOF
     ProxyPass /socket.io/ ws://127.0.0.1:5678/socket.io/ nocanon\
     ProxyPassReverse /socket.io/ ws://127.0.0.1:5678/socket.io/\
     ProxyPass /ws ws://127.0.0.1:5678/ws nocanon\
-    ProxyPassReverse /ws ws://127.0.0.1:5678/ws' /etc/apache2/sites-available/$domain_name.conf
+    ProxyPassReverse /ws ws://127.0.0.1:5678/ws\
+    ProxyPass /webhooks/ ws://127.0.0.1:5678/webhooks/ nocanon\
+    ProxyPassReverse /webhooks/ ws://127.0.0.1:5678/webhooks/' /etc/apache2/sites-available/$domain_name.conf
                 fi
             fi
             
@@ -965,6 +1402,7 @@ EOF
             # 10. Run final connectivity tests
             echo -e "${BLUE}Running final connectivity tests...${NC}"
             fix_service_unavailable "$domain_name"
+            test_final_connectivity "$domain_name"
             
             # 11. Check if n8n is now working
             if systemctl is-active --quiet n8n; then
@@ -1238,6 +1676,7 @@ EOF
     if systemctl is-active --quiet n8n; then
         echo -e "${BLUE}Testing and configuring WebSocket connections...${NC}"
         test_websockets "$domain_name"
+        test_final_connectivity "$domain_name"
     fi
 
     # Summary
