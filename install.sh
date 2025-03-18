@@ -37,12 +37,12 @@ check_requirements() {
 
     # Check for Node.js (required for n8n)
     if ! command_exists node; then
-        echo -e "${YELLOW}Node.js is not installed. Installing...${NC}"
+        echo -e "${YELLOW}Node.js is not installed. Installing LTS version...${NC}"
         apt-get update
         apt-get install -y ca-certificates curl gnupg
         mkdir -p /etc/apt/keyrings
         curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
-        echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_18.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
+        echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_lts nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
         apt-get update
         apt-get install -y nodejs
     fi
@@ -59,7 +59,7 @@ check_requirements() {
 
     # Check for Apache modules
     echo -e "${BLUE}Enabling required Apache modules...${NC}"
-    a2enmod proxy proxy_http proxy_wstunnel headers rewrite auth_basic authn_file
+    a2enmod proxy proxy_http proxy_wstunnel headers rewrite auth_basic authn_file ssl proxy_balancer proxy_connect
 }
 
 # Install n8n
@@ -99,9 +99,21 @@ WorkingDirectory=/var/lib/n8n
 Environment=N8N_HOST=localhost
 Environment=N8N_PORT=5678
 Environment=NODE_ENV=production
+Environment=N8N_PROTOCOL=http
+Environment=N8N_EDITOR_BASE_URL=
+Environment=N8N_METRICS=true
+Environment=N8N_DIAGNOSTICS_ENABLED=true
+Environment=N8N_HIRING_BANNER_ENABLED=false
+Environment=N8N_VERSION_NOTIFICATIONS_ENABLED=false
+Environment=N8N_USER_MANAGEMENT_DISABLED=false
+Environment=N8N_CLUSTER_ENABLED=false
+Environment=N8N_DIAGNOSTICS_CONFIG_STATS_SHARING_ENABLED=true
+Environment=WEBHOOK_URL=http://localhost:5678/
+Environment=WEBHOOK_TUNNEL_URL=
 ExecStart=$(which n8n) start
-Restart=on-failure
+Restart=always
 RestartSec=10
+LimitNOFILE=50000
 
 [Install]
 WantedBy=multi-user.target
@@ -144,12 +156,28 @@ create_apache_config() {
     ProxyPass /favicon.ico http://localhost:5678/favicon.ico
     ProxyPass /webhook http://localhost:5678/webhook
     ProxyPass /rest http://localhost:5678/rest
+    
+    # Enhanced WebSocket handling - ensures all WebSocket paths work correctly
+    # Main WebSocket endpoints
     ProxyPass /ws ws://localhost:5678/ws
-
-    # Remove Upgrade header for non-websocket connections
-    SetEnvIf Upgrade "^WebSocket$" WS=1
-    RequestHeader set Connection "upgrade" env=WS
-    RequestHeader set Upgrade "websocket" env=WS
+    ProxyPassReverse /ws ws://localhost:5678/ws
+    ProxyPass /socket.io/ ws://localhost:5678/socket.io/
+    ProxyPassReverse /socket.io/ ws://localhost:5678/socket.io/
+    
+    # Advanced WebSocket handling with proper upgrade headers
+    RewriteEngine On
+    RewriteCond %{HTTP:Upgrade} websocket [NC]
+    RewriteCond %{HTTP:Connection} upgrade [NC]
+    RewriteRule ^/?(.*) ws://localhost:5678/$1 [P,L,NE]
+    
+    # Ensure headers are correctly set for all proxied requests
+    ProxyAddHeaders On
+    RequestHeader set X-Forwarded-Proto "http"
+    RequestHeader set X-Forwarded-Port "80"
+    
+    # Prevent timeouts for long-running WebSocket connections
+    ProxyTimeout 3600
+    Timeout 3600
 
     # Headers
     Header always set Strict-Transport-Security "max-age=63072000; includeSubdomains;"
@@ -259,24 +287,74 @@ main() {
 
     # Verify connection to n8n
     echo -e "${BLUE}Verifying connection to n8n...${NC}"
+    
+    # Test HTTP connection first
     if curl -s http://localhost:5678/ > /dev/null; then
         echo -e "${GREEN}n8n is responding on localhost:5678${NC}"
+        
+        # Test Apache proxy connection
+        echo -e "${BLUE}Testing Apache proxy connection...${NC}"
+        if curl -s -I http://$domain_name/ -H "Host: $domain_name" --resolve "$domain_name:80:127.0.0.1" | grep -i "HTTP/1.1 401"; then
+            echo -e "${GREEN}Apache proxy is correctly forwarding to n8n (401 response with auth expected)${NC}"
+        else
+            echo -e "${YELLOW}Apache proxy is not responding as expected. Check Apache configuration.${NC}"
+            echo -e "${BLUE}Restarting Apache...${NC}"
+            systemctl restart apache2
+        fi
+        
+        # Verify WebSocket modules
+        echo -e "${BLUE}Verifying WebSocket modules...${NC}"
+        if apache2ctl -M | grep -E 'proxy_wstunnel|rewrite'; then
+            echo -e "${GREEN}WebSocket modules are properly enabled${NC}"
+        else
+            echo -e "${YELLOW}WebSocket modules may not be properly enabled. Re-enabling...${NC}"
+            a2enmod proxy_wstunnel rewrite
+            systemctl restart apache2
+        fi
     else
         echo -e "${RED}Could not connect to n8n on localhost:5678${NC}"
         echo -e "${YELLOW}Trying alternative troubleshooting...${NC}"
 
+        # Diagnose potential n8n startup issues
+        echo -e "${BLUE}Checking for common n8n issues...${NC}"
+        
+        # Check if port 5678 is in use by another process
+        if netstat -tulpn | grep 5678; then
+            echo -e "${YELLOW}Port 5678 is already in use by another process. Stopping conflicting process...${NC}"
+            fuser -k 5678/tcp || true
+        fi
+        
         # Try with different user
         echo -e "${BLUE}Adjusting service to run as current user...${NC}"
         current_user=$(logname || echo "root")
         sed -i "s/User=root/User=$current_user/" /etc/systemd/system/n8n.service
+        
+        # Fix permissions for n8n directory
+        echo -e "${BLUE}Adjusting permissions for n8n directory...${NC}"
+        chown -R $current_user:$current_user /var/lib/n8n
+        
+        # Reload and restart
         systemctl daemon-reload
         systemctl restart n8n
-        sleep 5
+        sleep 8
 
         if systemctl is-active --quiet n8n; then
             echo -e "${GREEN}n8n service started successfully with user $current_user!${NC}"
         else
-            echo -e "${RED}Still having issues. Please check the logs.${NC}"
+            echo -e "${RED}Still having issues with n8n service.${NC}"
+            echo -e "${YELLOW}Trying one more fix: reinstalling n8n with npm cache clean...${NC}"
+            
+            npm cache clean --force
+            npm install -g n8n --unsafe-perm
+            systemctl restart n8n
+            sleep 5
+            
+            if systemctl is-active --quiet n8n; then
+                echo -e "${GREEN}n8n service started successfully after cache clean!${NC}"
+            else
+                echo -e "${RED}n8n service still failing. Please check the detailed logs.${NC}"
+                journalctl -u n8n -n 30
+            fi
         fi
     fi
 
@@ -301,12 +379,16 @@ main() {
     echo -e "  View logs: ${GREEN}journalctl -u n8n -f${NC}"
 
     echo -e "\n${BLUE}Troubleshooting:${NC}"
-    echo -e "  If you see 'Service Unavailable', try these steps:"
+    echo -e "  If you see 'Service Unavailable' or have WebSocket connection issues, try these steps:"
     echo -e "  1. Check n8n status: ${GREEN}systemctl status n8n${NC}"
-    echo -e "  2. Check logs: ${GREEN}journalctl -u n8n -f${NC}"
+    echo -e "  2. Check logs: ${GREEN}journalctl -u n8n -f${NC} and ${GREEN}tail -f /var/log/apache2/error.log${NC}"
     echo -e "  3. Make sure port 5678 is not in use: ${GREEN}netstat -tulpn | grep 5678${NC}"
     echo -e "  4. Restart n8n and Apache: ${GREEN}systemctl restart n8n apache2${NC}"
-    echo -e "  5. Try reinstalling n8n with: ${GREEN}npm install -g n8n --unsafe-perm${NC}"
+    echo -e "  5. Verify WebSocket modules are enabled: ${GREEN}apache2ctl -M | grep -E 'proxy_wstunnel|rewrite'${NC}"
+    echo -e "  6. Test direct WebSocket connection: ${GREEN}curl -v -N -H \"Connection: Upgrade\" -H \"Upgrade: websocket\" http://localhost:5678/ws${NC}"
+    echo -e "  7. Check for WebSocket errors in browser console (F12) when using the n8n interface"
+    echo -e "  8. Try reinstalling n8n with: ${GREEN}npm install -g n8n --unsafe-perm${NC}"
+    echo -e "  9. If you see '502 Bad Gateway' errors, check that n8n is running and listening on localhost:5678"
 
     echo -e "\n${GREEN}Script by Antonin Nvh - https://codequantum.io${NC}"
 }
